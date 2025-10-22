@@ -62,5 +62,5 @@ This implementation adds adaptive volume weighting and ATR scaling for real-time
 
 ## 🪪 License
 This project is released under the **MIT License**.  
-See the header in `Flux AVW Dashboard.txt` or the [`LICENSE`](LICENSE) file for details.
+See the header in `Flux AVW Dashboard.txt` for details.
 
