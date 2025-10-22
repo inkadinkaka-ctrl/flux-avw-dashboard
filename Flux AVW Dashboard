@@ -1,0 +1,444 @@
+
+// © inkadinka_ka
+
+// MIT License
+// Copyright (c) 2025 Ken Anderson
+// SPDX-License-Identifier: MIT
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+// -----------------------------------------------------------------------------
+// Flux AVW Dashboard — Volatility-Normalized, Volume-Weighted Momentum
+// © 2025 Ken Anderson. Original code.
+//
+// Conceptual inspiration: MACD-V (volatility-normalized MACD) by Alex Spiroglou.
+// This script implements an independent, volume-weighted variant with additional
+// features (ATR scaling, slope-in-ATR, VWAP Δ, CVD proxy, and probability table).
+// No third-party code is included. Not affiliated with, endorsed by, or derived
+// from any proprietary MACD-V implementation.
+// -----------------------------------------------------------------------------
+
+
+
+//@version=6
+indicator("Flux AVW Dashboard", shorttitle="Flux AVW", overlay=true, max_labels_count=500, max_lines_count=500)
+
+//============================= GROUPS =============================
+string grpPreset  = "Presets"
+string grpCore    = "Core Settings"
+string grpVol     = "Volatility Normalization"
+string grpViz     = "Visuals"
+string grpSignals = "Signals & Risk"
+string grpDash    = "Dashboard"
+
+//============================= PRESETS ============================
+string preset = input.string("LBR 3-10-16 (fast)", "Preset", options=["LBR 3-10-16 (fast)","Classic 12-26-9","Scalp/Fast","Swing/Position"], group=grpPreset)
+
+// Inputs (literal defaults; presets applied after)
+float  src        = input.source(close, "Source", group=grpCore)
+string maType     = input.string("EMA", "MA Type (price legs)", options=["EMA","SMA","RMA"], group=grpCore)
+int    fastLen_in = input.int(3,  "Fast Length",   minval=1, group=grpCore)
+int    slowLen_in = input.int(10, "Slow Length",   minval=1, group=grpCore)
+int    sigLen_in  = input.int(8,  "Signal Length", minval=1, group=grpCore)
+
+//============================= VOL NORMALIZATION ===================
+int  atrLen_in  = input.int(10, "ATR Length (base)", minval=1, group=grpVol)
+int  atrSmooth  = input.int(30, "ATR Smoothing (adaptive)", minval=1, group=grpVol)
+bool useAVW     = input.bool(true,"Use Volume-Weighted Momentum in MACD-V", group=grpVol)
+bool scaleX100  = input.bool(true,"Scale MACD-V ×100 for readability", group=grpVol)
+
+// Resolve effective lengths from preset OR manual inputs
+int fastLen = preset == "Classic 12-26-9" ? 12 : preset == "Scalp/Fast" ? 4  : preset == "Swing/Position" ? 8  : fastLen_in
+int slowLen = preset == "Classic 12-26-9" ? 26 : preset == "Scalp/Fast" ? 12 : preset == "Swing/Position" ? 21 : slowLen_in
+int sigLen  = preset == "Classic 12-26-9" ? 9  : preset == "Scalp/Fast" ? 6  : preset == "Swing/Position" ? 9  : sigLen_in
+int atrLen  = preset == "Classic 12-26-9" ? 26 : preset == "Scalp/Fast" ? 10 : preset == "Swing/Position" ? 14 : atrLen_in
+
+//============================= VISUALS =============================
+bool   showDash     = input.bool(true, "Show Dashboard", group=grpDash)
+string dashCorner   = input.string("bottom_right","Dashboard Corner", options=["top_left","top_center","top_right","bottom_left","bottom_center","bottom_right"], group=grpDash)
+int    dashThrottle = input.int(2, "Refresh dashboard every N bars", minval=1, group=grpDash)  // throttles redraws
+
+// Optional padding (empty rows) to give the table breathing room
+int padTopRows    = input.int(1, "Top padding rows",    minval=0, maxval=3, group=grpDash)
+int padBottomRows = input.int(1, "Bottom padding rows", minval=0, maxval=3, group=grpDash)
+
+
+color  upCol        = input.color(color.new(color.teal, 0), "Bull Color", group=grpViz)
+color  dnCol        = input.color(color.new(color.red,  0), "Bear Color", group=grpViz)
+color  nuCol        = input.color(color.new(color.silver,40),"Neutral Color", group=grpViz)
+
+// MAs & VWAP
+bool   showEMA9     = input.bool(true,  "Show Short MA", group=grpViz)
+bool   showEMA21    = input.bool(true,  "Show Long MA",  group=grpViz)
+bool   showVWAP     = input.bool(true,  "Show VWAP", group=grpViz)
+string maTypeShort  = input.string("EMA", "Short MA Type", options=["EMA","SMA","RMA","HMA"], group=grpViz)
+string maTypeLong   = input.string("EMA", "Long  MA Type",  options=["EMA","SMA","RMA","HMA"], group=grpViz)
+// NEW: make overlay MA types optionally mirror the core engine MA type
+bool   linkOverlayToCore = input.bool(false, "Link overlay MA types to Core MA Type", group=grpViz)
+
+int    shortLenMA = input.int(9,  "Short MA Length", minval=1, group=grpViz)
+int    longLenMA  = input.int(21, "Long  MA Length", minval=1, group=grpViz)
+
+
+
+
+color  ema9Color    = input.color(color.rgb(65,105,225), "Short MA Color (Royal Blue)", group=grpViz)
+
+
+
+
+color  ema21Color   = input.color(color.yellow, "Long MA Color (Yellow)", group=grpViz)
+color  vwapColor    = input.color(color.white,  "VWAP Color (White)", group=grpViz)
+int    maWidth      = input.int(2, "MA/VWAP Line Width", minval=1, maxval=5, group=grpViz)
+string vwapSourceOpt = input.string("HLC3", "VWAP Source", options=["Close","HLC3","OHLC4"], group=grpViz)
+
+// VWAP bands
+bool   showVWAPBands = input.bool(true,  "Show VWAP Bands", group=grpViz)
+string vwapBandType  = input.string("ATR", "VWAP Band Type", options=["ATR","StdDev"], group=grpViz)
+int    vwapBandLen   = input.int(14, "Band Length", minval=1, group=grpViz)
+float  vwapBandMult  = input.float(1.0, "Band Multiplier", minval=0.1, step=0.1, group=grpViz)
+color  vwapBandColor = input.color(color.new(color.gray, 50), "Band Line Color", group=grpViz)
+int    vwapBandWidth = input.int(1, "Band Line Width", minval=1, maxval=3, group=grpViz)
+bool   vwapFillBand  = input.bool(true, "Fill between Bands", group=grpViz)
+color  vwapFillColor = input.color(color.new(color.gray, 90), "Band Fill Color", group=grpViz)
+
+// Background shading OFF by default (toggle if needed)
+bool   showAOIShade  = input.bool(false, "Shade background on signals (AOI)", group=grpViz)
+int    aoiAlpha      = input.int(92,     "AOI shade transparency (0-100)", minval=0, maxval=100, group=grpViz)
+
+//============================= SIGNALS & RISK ======================
+bool   showArrows      = input.bool(true,  "Plot entry arrows", group=grpSignals)
+int    slopeLen        = input.int(25,     "Trend slope length", minval=5, group=grpSignals)
+float  slopeMinATR     = input.float(0.05, "Min slope in ATR units", step=0.01, group=grpSignals)
+bool   useCross        = input.bool(true,  "Use crossover entries (vs state)", group=grpSignals)
+bool   useNewsQuiet    = input.bool(true,  "Mute signals around 8:30 AM ET", group=grpSignals)
+int    quietMinutes    = input.int(10,     "Quiet window ± minutes", minval=0, maxval=60, group=grpSignals)
+bool   alsoMute10am    = input.bool(false, "Also mute around 10:00 AM ET", group=grpSignals)
+bool   useRTHGate      = input.bool(false, "Only allow signals in RTH (ET)", group=grpSignals)
+string rthSessET       = input.session("0930-1600", "RTH Session (ET)", group=grpSignals)
+
+// Thresholds for dashboard metrics
+float  awvThresh       = input.float(0.002, "AWV Δ threshold", step=0.0005, group=grpSignals)
+int    cvdLookback     = input.int(20, "CVD Δ lookback (bars)", minval=1, group=grpSignals)
+float  cvdThresh       = input.float(0.05, "CVD Δ threshold", step=0.01, group=grpSignals)
+float  nearVWAP_ATR    = input.float(0.25, "VWAP Δ 'near' threshold (ATRs)", step=0.05, group=grpSignals)
+
+// NEW: Stability inputs for State/Trend
+float  histEps       = input.float(0.20, "State neutral band (|Hist|)", step=0.05, group=grpSignals) // if scaleX100=true, ~0.2 units
+float  slopeEpsATR   = input.float(0.00, "Extra slope buffer (ATR units)", step=0.01, group=grpSignals)
+
+//============================= HELPERS ==============================
+// General MA
+f_ma(_x, _len, _type) => _type == "SMA" ? ta.sma(_x, _len) : _type == "RMA" ? ta.rma(_x, _len) : ta.ema(_x, _len)
+// Any MA incl. HMA
+f_ma_any(_x, _len, _type) => _type == "SMA" ? ta.sma(_x, _len) : _type == "RMA" ? ta.rma(_x, _len) : _type == "HMA" ? ta.hma(_x, _len) : ta.ema(_x, _len)
+// Safe tanh
+f_tanh(x) => 2.0 / (1.0 + math.exp(-2.0 * x)) - 1.0
+// z-score
+f_zscore(_x, _n) =>
+    float m = ta.sma(_x, _n)
+    float s = ta.stdev(_x, _n)
+    s == 0.0 ? 0.0 : (_x - m) / s
+// Corner mapping
+var posDash = position.bottom_right
+posDash := dashCorner == "top_left" ? position.top_left : dashCorner == "top_center" ? position.top_center : dashCorner == "top_right" ? position.top_right : dashCorner == "bottom_left" ? position.bottom_left : dashCorner == "bottom_center" ? position.bottom_center : position.bottom_right
+
+//============================= CORE CALCS ===========================
+float atr  = ta.atr(atrLen)
+float vwapSrc = vwapSourceOpt == "Close" ? close : vwapSourceOpt == "HLC3" ? hlc3 : ohlc4
+float vwap    = ta.vwap(vwapSrc)
+
+// Adaptive normalization factor
+float smaAtr = math.max(1e-6, ta.sma(atr, atrSmooth))
+float atrAdaptive = atr / smaAtr
+
+// Price-MA legs for classic MACD-V (if useAVW=false)
+float maF = f_ma(src, fastLen, maType)
+float maS = f_ma(src, slowLen, maType)
+
+// AVW legs (always compute for AWV Δ display)
+float vEF = math.max(1e-6, ta.ema(volume, fastLen))
+float vES = math.max(1e-6, ta.ema(volume, slowLen))
+float avwFast = ta.ema(volume * src, fastLen) / vEF
+float avwSlow = ta.ema(volume * src, slowLen) / vES
+float awvDelta = avwFast - avwSlow // <-- AWV Δ for dashboard
+
+// MACD-V core (using AVW or classic per toggle)
+float legFast   = useAVW ? avwFast : f_ma(src, fastLen, maType)
+float legSlow   = useAVW ? avwSlow : f_ma(src, slowLen, maType)
+float macdVCore = legFast - legSlow
+
+// Volatility-normalized MACD-V
+float denom       = atrAdaptive
+float volNormRaw  = denom == 0.0 ? 0.0 : macdVCore / denom
+float volNorm     = scaleX100 ? volNormRaw * 100.0 : volNormRaw
+float volNormSig  = ta.ema(volNorm, sigLen)
+float volNormHist = volNorm - volNormSig
+
+// Subsystems
+float momComp = f_tanh(volNormHist) // momentum from MACD-V hist
+
+// Trend slope (linreg) in ATR units
+float lrNow  = ta.linreg(src, slopeLen, 0)
+float lrPrev = ta.linreg(src, slopeLen, 1)
+float slope  = lrNow - lrPrev
+float slopeATR = slope / (atr == 0.0 ? 1e-6 : atr)
+float trendComp = f_tanh(slopeATR)
+
+// Volume pulse proxy
+float ret1 = math.log(close) - math.log(close[1])
+float volPulse = f_zscore(volume, 20) * f_zscore(ret1, 20)
+float volComp  = f_tanh(volPulse)
+
+// Squeeze proxy
+int   sqLen   = 20
+float bbW     = ta.stdev(src, sqLen) * 2.0
+float kcW     = ta.atr(sqLen) * 1.5
+bool  inSqz   = bbW < kcW
+float sqzComp = inSqz ? -0.6 : 0.6
+
+// Composite score & probabilities
+float score = 0.40 * momComp + 0.30 * trendComp + 0.20 * volComp + 0.10 * sqzComp
+float probLong  = 100.0 * (1.0 / (1.0 + math.exp(-2.5 * score)))
+float probShort = 100.0 - probLong
+
+//============================= STABILITY LOGIC ======================
+// Use confirmed values while the bar is live to avoid flicker
+float histUsed     = barstate.isrealtime ? nz(volNormHist[1]) : volNormHist
+float slopeATRUsed = barstate.isrealtime ? nz(slopeATR[1])    : slopeATR
+
+// State with neutral band
+bool stateLong  = histUsed >  histEps
+bool stateShort = histUsed < -histEps
+bool stateFlat  = not stateLong and not stateShort
+
+// Trend with optional extra buffer
+bool slopeOKL = slopeATRUsed >  (slopeMinATR + slopeEpsATR)
+bool slopeOKS = slopeATRUsed < -(slopeMinATR + slopeEpsATR)
+bool slopeFlat = not slopeOKL and not slopeOKS
+
+// AWV / CVD classifications
+bool awvBull = awvDelta >  awvThresh
+bool awvBear = awvDelta < -awvThresh
+
+float cvdDelta = volume * math.sign(close - open)
+float cvd      = ta.cum(cvdDelta)
+float cvdChange = (cvd - nz(cvd[cvdLookback], cvd)) / math.max(1, cvdLookback)
+bool  cvdBull = cvdChange >  cvdThresh
+bool  cvdBear = cvdChange < -cvdThresh
+
+// Subsystem votes (4): Momentum, Trend, Volume Pulse, AWV
+bool voteMomL = stateLong
+bool voteMomS = stateShort
+bool voteTrdL = slopeOKL
+bool voteTrdS = slopeOKS
+bool voteVolL = volPulse > 0
+bool voteVolS = volPulse < 0
+bool voteAwvL = awvBull
+bool voteAwvS = awvBear
+
+int agreeL = (voteMomL?1:0) + (voteTrdL?1:0) + (voteVolL?1:0) + (voteAwvL?1:0)
+int agreeS = (voteMomS?1:0) + (voteTrdS?1:0) + (voteVolS?1:0) + (voteAwvS?1:0)
+
+string biasTxt = agreeL >= 3 ? "Bull Bias" : agreeS >= 3 ? "Bear Bias" : "Neutral Bias"
+int    biasAgree = agreeL >= 3 ? agreeL : agreeS >= 3 ? agreeS : math.max(agreeL, agreeS)
+
+// Probability row (dynamic)
+bool   probIsLong  = agreeL > agreeS
+bool   probIsShort = agreeS > agreeL
+string probText    = probIsLong ? (str.tostring(probLong, "#") + "% Long") : probIsShort ? (str.tostring(probShort, "#") + "% Short") : (str.tostring(probLong, "#") + "% Neutral")
+
+// VWAP Δ
+float  vwapDeltaATR = (close - vwap) / (atr == 0.0 ? 1e-6 : atr)
+string vwapWhere    = math.abs(vwapDeltaATR) < nearVWAP_ATR ? "near" : (vwapDeltaATR > 0 ? "above" : "below")
+
+//============================= SIGNALS (optional) ===================
+// Cross/state triggers for arrows
+bool crossL = ta.crossover(volNormHist, 0.0) and slopeOKL
+bool crossS = ta.crossunder(volNormHist, 0.0) and slopeOKS
+bool baseL  = useCross ? crossL : (stateLong and slopeOKL)
+bool baseS  = useCross ? crossS : (stateShort and slopeOKS)
+
+// News quiet windows
+string tz = "America/New_York"
+float curH = hour(time, tz) + (minute(time, tz) / 60.0)
+bool near830  = math.abs(curH - 8.5) * 60.0 <= quietMinutes
+bool near1000 = alsoMute10am and (math.abs(curH - 10.0) * 60.0 <= quietMinutes)
+bool inNewsQuiet = useNewsQuiet and (near830 or near1000)
+if inNewsQuiet
+    baseL := false
+    baseS := false
+
+// RTH gate
+bool inRTH = not na(time(timeframe.period, rthSessET))
+if useRTHGate and not inRTH
+    baseL := false
+    baseS := false
+
+// Plot arrows
+plotshape(showArrows and baseL, title="Long",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, color=upCol, text="L")
+plotshape(showArrows and baseS, title="Short", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=dnCol, text="S")
+
+//============================= MAs & VWAP ===========================
+// MAs
+
+// Effective MA types for overlay lines
+string effShortType = linkOverlayToCore ? maType : maTypeShort
+string effLongType  = linkOverlayToCore ? maType : maTypeLong
+
+// MAs
+float maShort = f_ma_any(close, shortLenMA, effShortType)
+float maLong  = f_ma_any(close, longLenMA,  effLongType)
+plot(showEMA9  ? maShort : na, title="Short MA", color=ema9Color,  linewidth=maWidth)
+plot(showEMA21 ? maLong  : na,  title="Long MA",  color=ema21Color, linewidth=maWidth)
+
+
+
+// VWAP center
+plot(showVWAP ? vwap : na, title="VWAP", color=vwapColor, linewidth=maWidth)
+
+// VWAP bands + fill
+float bandW     = vwapBandType == "ATR" ? ta.atr(vwapBandLen) * vwapBandMult : ta.stdev(close, vwapBandLen) * vwapBandMult
+float vwapUpper = vwap + bandW
+float vwapLower = vwap - bandW
+bool  showVWAPEnv = showVWAPBands and showVWAP
+pUpper = plot(showVWAPEnv ? vwapUpper : na, title="VWAP Upper", color=vwapBandColor, linewidth=vwapBandWidth)
+pLower = plot(showVWAPEnv ? vwapLower : na, title="VWAP Lower", color=vwapBandColor, linewidth=vwapBandWidth)
+fill(pUpper, pLower, color=(showVWAPEnv and vwapFillBand) ? vwapFillColor : color.new(color.white, 100), title="VWAP Band Fill")
+
+//============================= DASHBOARD ============================
+// Base (content) rows = 10. Add top/bottom padding rows around them.
+var int BASE_ROWS   = 10
+var int DASH_COLS   = 2
+var table dashTbl   = na
+var string _prevCorner = na
+var int _prevRows   = na
+
+// Colors for value cells
+color momBg   = stateLong ? upCol : stateShort ? dnCol : nuCol
+color trendBg = slopeOKL ? upCol : slopeOKS ? dnCol : nuCol
+color volBg   = volPulse > 0 ? upCol : volPulse < 0 ? dnCol : nuCol
+color probBg  = probIsLong ? upCol : probIsShort ? dnCol : nuCol
+color awvBg   = awvBull ? upCol : awvBear ? dnCol : nuCol
+color cvdBg   = cvdBull ? upCol : cvdBear ? dnCol : nuCol
+color lblBg   = color.new(color.black, 0) // neutral label column
+
+// Strings for secondary stats (always visible)
+string scoreTxt   = " (score " + str.tostring(score, "+#.00") + ")"
+string biasRowTxt = biasTxt + " (" + str.tostring(biasAgree) + " of 4 agree)"
+string trendTxt   = " (Δ " + str.tostring(slopeATRUsed, "+#.00") + " ATR)"
+string volTxt     = " (zV×zR " + str.tostring(volPulse, "+#.0") + ")"
+string awvTxt     = " (thr ±" + str.tostring(awvThresh, "#.000") + ")"
+string cvdTxt     = " (Δ " + str.tostring(cvdChange, "+#.00") + ")"
+string vwapTxt    = " (" + vwapWhere + ")"
+string atrTxt     = " (bands ×" + str.tostring(vwapBandMult, "#.0") + ")"
+
+// Header background tint by bias
+color headerTint = biasTxt == "Bull Bias" ? color.new(upCol, 85) : biasTxt == "Bear Bias" ? color.new(dnCol, 85) : color.new(color.gray, 85)
+
+// ---- Compute total rows and content start row (padding offset)
+int TOTAL_ROWS = BASE_ROWS + padTopRows + padBottomRows
+int r = padTopRows // offset for first content row
+
+// ---- Ensure table exists (or recreate if corner or size changed)
+if showDash and (na(dashTbl) or _prevCorner != dashCorner or _prevRows != TOTAL_ROWS)
+    if not na(dashTbl)
+        table.delete(dashTbl)
+    dashTbl := table.new(posDash, DASH_COLS, TOTAL_ROWS, border_width=1)
+    _prevCorner := dashCorner
+    _prevRows   := TOTAL_ROWS
+
+
+// ---- Draw on last or last-confirmed history bar
+bool lastBar   = barstate.islast or barstate.islastconfirmedhistory
+// Redraw table less often (throttled)
+bool redrawNow = showDash and lastBar and ((bar_index % dashThrottle == 0) or na(dashTbl) or (_prevCorner != dashCorner))
+// Update values every single bar (no heavy clear/relabel)
+bool updateNow = showDash and lastBar
+
+
+
+
+
+
+// ================= Full redraw (headers + left labels) =================
+if redrawNow
+    // Clear the whole table
+    table.clear(dashTbl, 0, 0, DASH_COLS - 1, TOTAL_ROWS - 1)
+
+    // Header
+    table.cell(dashTbl, 0, r + 0, "Flux AVW", text_color=color.white, bgcolor=headerTint)
+    table.cell(dashTbl, 1, r + 0, "",         text_color=color.white, bgcolor=headerTint)
+
+    // Left-column static labels (only need to paint on redraw)
+    table.cell(dashTbl, 0, r + 1, "Probability", text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 2, "Bias",        text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 3, "State",       text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 4, "Trend",       text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 5, "Volume",      text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 6, "AWV Δ",       text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 7, "CVD",         text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 8, "VWAP Δ",      text_color=color.white, bgcolor=lblBg)
+    table.cell(dashTbl, 0, r + 9, "ATR",         text_color=color.white, bgcolor=lblBg)
+
+// ================= Lightweight value update (every bar) ===============
+if updateNow
+    // Probability (with score)
+    table.cell(dashTbl, 1, r + 1, probText + " (score " + str.tostring(score, "+#.00") + ")", text_color=color.white, bgcolor=probIsLong ? upCol : probIsShort ? dnCol : nuCol)
+
+    // Bias (N of 4 agree)
+    table.cell(dashTbl, 1, r + 2, biasTxt + " (" + str.tostring(biasAgree) + " of 4 agree)", text_color=color.white, bgcolor=(biasTxt=="Bull Bias"?upCol:(biasTxt=="Bear Bias"?dnCol:nuCol)))
+
+    // State (neutral band)
+    string stateTxt = stateLong ?  "Bull (hist > "  + str.tostring(histEps, "#.00") + ")" :
+                      stateShort ? "Bear (hist < -" + str.tostring(histEps, "#.00") + ")" :
+                                   "Flat (|hist| ≤ " + str.tostring(histEps, "#.00") + ")"
+    table.cell(dashTbl, 1, r + 3, stateTxt, text_color=color.white, bgcolor=(stateLong?upCol:(stateShort?dnCol:nuCol)))
+
+    // Trend (slope in ATR units)
+    string trendName = slopeOKL ? "UpSlope" : slopeOKS ? "DnSlope" : "FlatSlope"
+    table.cell(dashTbl, 1, r + 4, trendName + " (Δ " + str.tostring(slopeATRUsed, "+#.00") + " ATR)", text_color=color.white, bgcolor=(slopeOKL?upCol:(slopeOKS?dnCol:nuCol)))
+
+    // Volume pulse
+    table.cell(dashTbl, 1, r + 5, (volPulse>0 ? "BuyVol" : volPulse<0 ? "SellVol" : "Quiet") + " (zV×zR " + str.tostring(volPulse, "+#.0") + ")", text_color=color.white, bgcolor=(volPulse>0?upCol:(volPulse<0?dnCol:nuCol)))
+
+    // AWV Δ
+    table.cell(dashTbl, 1, r + 6, str.tostring(awvDelta, "+#.000") + " (thr ±" + str.tostring(awvThresh, "#.000") + ")", text_color=color.white, bgcolor=(awvDelta>awvThresh?upCol:(awvDelta<-awvThresh?dnCol:nuCol)))
+
+    // CVD
+    table.cell(dashTbl, 1, r + 7, (cvdBull ? "Positive" : cvdBear ? "Negative" : "Balanced") + " (Δ " + str.tostring(cvdChange, "+#.00") + ")", text_color=color.white, bgcolor=(cvdBull?upCol:(cvdBear?dnCol:nuCol)))
+
+    // VWAP Δ
+    table.cell(dashTbl, 1, r + 8, str.tostring(vwapDeltaATR, "+#.0") + " ATR (" + vwapWhere + ")", text_color=color.white, bgcolor=lblBg)
+
+    // ATR
+    table.cell(dashTbl, 1, r + 9, str.tostring(atr, "#.00") + " (bands ×" + str.tostring(vwapBandMult, "#.0") + ")", text_color=color.white, bgcolor=lblBg)
+
+
+
+    // (Bottom padding rows are simply the trailing empty rows after r+9)
+
+
+
+
+
+//============================= BACKGROUND (optional, off) ===========
+bool aoiActive = baseL or baseS
+color aoiBg = baseL ? color.new(upCol, aoiAlpha) : color.new(dnCol, aoiAlpha)
+bgcolor(showAOIShade and aoiActive ? aoiBg : na)
